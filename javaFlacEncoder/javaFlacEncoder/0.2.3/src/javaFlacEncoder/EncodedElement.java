@@ -183,7 +183,7 @@ public class EncodedElement {
 	 *            the byte array to store. Pre-condition: None Post-condition: 'data' is now stored
 	 *            by this object. Any previous data stored was lost.
 	 */
-	void setData(byte[] data) {
+	public void setData(byte[] data) {
 		this.data = data;
 	}
 
@@ -193,7 +193,7 @@ public class EncodedElement {
 	 * @param bits
 	 *            the value to store
 	 */
-	void setUsableBits(int bits) {
+	public void setUsableBits(int bits) {
 		usableBits = bits;
 	}
 
@@ -202,7 +202,7 @@ public class EncodedElement {
 	 * @param byte[] the data stored in this byte[] is likely not all usable. Method getUsableBits()
 	 *        should be used to determine such.
 	 */
-	byte[] getData() {
+	public byte[] getData() {
 		return data;
 	}
 

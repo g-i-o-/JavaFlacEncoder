@@ -19,6 +19,7 @@
 
 package javaFlacEncoder;
 
+import java.util.ListIterator;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -30,6 +31,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import javaFlacEncoder.metadata.EncodedMetadata;
+import javaFlacEncoder.metadata.StreamInfo;
 
 /**
  * This class defines a FLAC Encoder with a simple interface for enabling FLAC encoding support in
@@ -52,11 +55,13 @@ import java.util.concurrent.LinkedBlockingQueue;
  * encodeSamples(...) methods' "end" parameter) </BLOCKQUOTE><br>
  * <br>
  * @author Preston Lacey
+ * @modified mar 2014 by gio - added EncodedMetadata for adding metadata to the flac file
+ * 
  */
 public class FLACEncoder {
 
-	/* For debugging, higher level equals more output */
-	private final int DEBUG_LEV = 0;
+    /* For debugging, higher level equals more output */
+    public int DEBUG_LEV = 0;
 
 	/**
 	 * Maximum Threads to use for encoding frames(more threads than this will exist, these threads
@@ -69,6 +74,9 @@ public class FLACEncoder {
 
 	/* streamConfig: Must never stay null(default supplied by constructor) */
 	private StreamConfiguration streamConfig;
+
+    /* list of metadata blocks to be encoded with the flac */
+    List<EncodedMetadata> metadataList = null;
 
 	/*
 	 * Set true if frames are actively being encoded(can't change settings while this is true) */
@@ -127,6 +135,7 @@ public class FLACEncoder {
 	/* position of header in output stream location(needed so we can update the header info(md5,
 	 * minBlockSize, etc), once encoding is done */
 	private long streamHeaderPos;
+
 
 	/* store used encodeRequests so we don't have to reallocate space for them */
 	private final BlockingQueue<BlockEncodeRequest> usedBlockEncodeRequests;
@@ -225,6 +234,20 @@ public class FLACEncoder {
 		return changed;
 	}
 
+    /**
+	 * @return the metadataList
+	 */
+	public List<EncodedMetadata> getMetadataList() {
+		return metadataList;
+	}
+
+	/**
+	 * @param metadataList the metadataList to set
+	 */
+	public void setMetadataList(List<EncodedMetadata> metadataList) {
+		this.metadataList = metadataList;
+	}
+
 	/**
 	 * Reset the values to their initial state, in preparation of starting a new stream. Does *not*
 	 * clear any stored, unwritten data. To flush stored samples, call clear().
@@ -288,20 +311,32 @@ public class FLACEncoder {
 		reset();
 		// write FLAC stream identifier
 		out.write(FLAC_id.getData(), 0, FLAC_id.getUsableBits() / 8);
-		// write stream headers. These must be updated at close of stream
-		byte[] md5Hash = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };// blank hash. Don't
-																			// know it yet.
-		EncodedElement streamInfo = MetadataBlockStreamInfo.getStreamInfo(streamConfig,
-				minFrameSize, maxFrameSize, samplesInStream, md5Hash);
-		// mark stream info location(so we can return to it and re-write headers,
-		// assuming stream is seekable. Then write header.
-		int size = streamInfo.getUsableBits() / 8;
-		EncodedElement metadataBlockHeader = MetadataBlockHeader.getMetadataBlockHeader(true,
-				MetadataBlockHeader.MetadataBlockType.STREAMINFO, size);
-		writeDataToOutput(metadataBlockHeader);
-		streamHeaderPos = out.getPos();
-		out.write(streamInfo.getData(), 0, size);
+        
+        StreamInfo mdStreamInfo = new StreamInfo(streamConfig, minFrameSize, maxFrameSize, samplesInStream);
+        boolean mdListEmpty = metadataList == null || metadataList.isEmpty();
+        streamHeaderPos = writeMetadata(mdStreamInfo, mdListEmpty);
+        if(!mdListEmpty){
+            for(ListIterator<EncodedMetadata> mdIt = metadataList.listIterator(); mdIt.hasNext();){
+            	EncodedMetadata metadata = mdIt.next();
+            	writeMetadata(metadata, !mdIt.hasNext());
+            }
+        }
 	}
+
+    protected long writeMetadata(EncodedMetadata metadata, boolean isLast) throws IOException{
+        byte[] data = metadata.asByteArray();
+        int dataLength = data.length;
+		byte[] header = {
+			(byte)((isLast ? 0x80 : 0) | metadata.getType().ordinal()), 
+			(byte)((dataLength >> 16) & 0xff),
+			(byte)((dataLength >>  8) & 0xff),
+			(byte)((dataLength      ) & 0xff)
+		};
+    	out.write(header, 0, 4);
+        long pos = out.getPos();
+        out.write(data, 0, data.length);
+        return pos;
+    }
 
 	/**
 	 * Add samples to the encoder, so they may then be encoded. This method uses breaks the samples
@@ -321,6 +356,117 @@ public class FLACEncoder {
 	 *         configuration.
 	 */
 	public boolean addSamples(int[] samples, int count) {
+		boolean added = false;
+		// get number of channels
+		int channels = streamConfig.getChannelCount();
+		int maxFrames = samples.length / channels;// input wav frames, not flac
+		int validSamples = count * channels;
+		if (DEBUG_LEV > 0) {
+			System.err.println("addSamples(...): "); // XXX
+			System.err.println("maxFrames: " + maxFrames); // XXX
+			System.err.println("validSamples: " + validSamples); // XXX
+			if (DEBUG_LEV > 10)
+				System.err.println("count:" + count + ":channels:" + channels); // XXX
+		}
+
+		if (count <= maxFrames) {// sample count is ok
+			added = true;
+			// break sample input into appropriately sized blocks
+			int samplesUsed = 0;// number of input samples used
+			if (unfinishedBlock != null) {
+				// finish off last block first.
+				if (DEBUG_LEV > 10) {
+					System.err.println("addSamples(...): filling unfinishedBlock"); // XXX
+				}
+
+				int blockSize = streamConfig.getMaxBlockSize();
+				int[] block = unfinishedBlock;
+				int unfinishedBlockRemaining = blockSize * channels - unfinishedBlockUsed;
+				if (unfinishedBlockRemaining <= 0) {
+					System.err.println("MAJOR ERROR HERE. Unfinsihed block remaining invalid: "
+							+ unfinishedBlockRemaining); // XXX
+					System.exit(-1);
+				}
+
+				int nextSampleStop = samplesUsed + unfinishedBlockRemaining;
+				if (nextSampleStop > validSamples) {
+					nextSampleStop = validSamples;
+				}
+				int i;
+				for (i = 0; i < unfinishedBlockRemaining && i < nextSampleStop; i++) {
+					block[unfinishedBlockUsed + i] = samples[samplesUsed + i];
+				}
+				unfinishedBlockUsed += i;
+				samplesUsed = nextSampleStop;
+				if (unfinishedBlockUsed == blockSize * channels) {
+					// System.err.println("Adding block: "+blocksAdded++ +":"+blockQueue.size());
+					blockQueue.add(block);
+					unfinishedBlockUsed = 0;
+					unfinishedBlock = null;
+				} else if (unfinishedBlockUsed > blockSize * channels) {
+					System.err.println("Error: FLACEncoder.addSamples(...) "
+							+ "unfinished block = " + unfinishedBlockUsed); // XXX
+					System.exit(-1);
+				}
+			}
+			while (samplesUsed < validSamples) {
+				if (DEBUG_LEV > 20)
+					System.err.println("addSamples(...): creating new block"); // XXX
+				// copy values to approrpiate locations
+				// add each finished array to the queue
+				/* <implement_for_variable_blocksize> blockSize = this.getNextBlockSize(samples,
+				 * validSamples); */
+				int blockSize = streamConfig.getMaxBlockSize();
+				// int[] block = new int[blockSize*channels];
+				int[] block = recycler.getArray(blockSize * channels);
+				int nextSampleStop = samplesUsed + blockSize * channels;
+				if (nextSampleStop > validSamples) {
+					// We don't have enough samples to make a full block.
+					if (DEBUG_LEV > 20)
+						System.err.println("addSamples(...): setting partial Block"); // XXX
+					// fill unfinishedBlock
+					nextSampleStop = validSamples;
+					unfinishedBlock = block;
+					unfinishedBlockUsed = validSamples - samplesUsed;
+				} else {
+					blockQueue.add(block);
+					// System.err.println("Adding block: "+blocksAdded++ +":"+blockQueue.size());
+				}
+				// System.err.println("samplesUsed: " + samplesUsed);
+				// System.err.println("Nextsamplestop: " + nextSampleStop);
+				for (int i = 0; i < nextSampleStop - samplesUsed; i++)
+					block[i] = samples[samplesUsed + i];
+				samplesUsed = nextSampleStop;
+			}
+		} else {
+			System.err.println("Error: FLACEncoder.addSamples " + "given count out of bounds"); // XXX
+		}
+
+		if (DEBUG_LEV > 20) {
+			System.err.println("Blocks stored: " + blockQueue.size()); // XXX
+			System.err.println("Samples in partial block: " + unfinishedBlockUsed); // XXX
+		}
+		return added;
+	}
+
+	/**
+	 * Add samples to the encoder, so they may then be encoded. This method uses breaks the samples
+	 * into blocks, which will then be made available to encode.
+	 * @param samples
+	 *            Array holding the samples to encode. For all multi-channel audio, the samples must
+	 *            be interleaved in this array. For example, with stereo: sample 0 will belong to
+	 *            the first channel, 1 the second, 2 the first, 3 the second, etc. Samples are
+	 *            interpreted according to the current configuration(for things such as channel and
+	 *            bits-per-sample).
+	 * @param count
+	 *            Number of interchannel samples to add. For example, with stero: if this is 4000,
+	 *            then "samples" must contain 4000 left samples and 4000 right samples, interleaved
+	 *            in the array.
+	 * @return true if samples were added, false otherwise. A value of false may result if "count" is
+	 *         set to a size that is too large to be valid with the given array and current
+	 *         configuration.
+	 */
+	public boolean addSamples(short[] samples, int count) {
 		boolean added = false;
 		// get number of channels
 		int channels = streamConfig.getChannelCount();
