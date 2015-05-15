@@ -7,7 +7,6 @@ import java.nio.ByteOrder;
 import java.util.HashMap;
 import java.util.Map;
 
-import com.gio.io.EndianAwareDataOutputStream;
 
 import javaFlacEncoder.MetadataBlockHeader.MetadataBlockType;
 
